@@ -83,7 +83,18 @@ func (s *Store) ValidateLog() error {
 func (s *Store) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return Snapshot{Cases: s.cases, Permits: s.permits, Version: s.seq}
+	cases := make(map[string]*domain.RiggingCase, len(s.cases))
+	for id, c := range s.cases {
+		var cp domain.RiggingCase
+		b, _ := json.Marshal(c)
+		_ = json.Unmarshal(b, &cp)
+		cases[id] = &cp
+	}
+	permits := make(map[string]string, len(s.permits))
+	for k, v := range s.permits {
+		permits[k] = v
+	}
+	return Snapshot{Cases: cases, Permits: permits, Version: s.seq}
 }
 func (s *Store) CaseIDs() []string {
 	s.mu.RLock()
