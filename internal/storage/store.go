@@ -71,6 +71,32 @@ func (s *Store) persist() error {
 	}
 	return os.Rename(tmp, filepath.Join(s.dir, "snapshot.json"))
 }
+// truncateEvents truncates events.jsonl to the first n bytes, used to undo an
+// appended event when a subsequent snapshot write fails.
+func (s *Store) truncateEvents(n int64) error {
+	if s.dir == "" {
+		return nil
+	}
+	p := filepath.Join(s.dir, "events.jsonl")
+	if n == 0 {
+		return os.Remove(p)
+	}
+	return os.Truncate(p, n)
+}
+func (s *Store) eventLogSize() (int64, error) {
+	if s.dir == "" {
+		return 0, nil
+	}
+	p := filepath.Join(s.dir, "events.jsonl")
+	fi, e := os.Stat(p)
+	if os.IsNotExist(e) {
+		return 0, nil
+	}
+	if e != nil {
+		return 0, e
+	}
+	return fi.Size(), nil
+}
 func (s *Store) Get(id string) (*domain.RiggingCase, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -92,17 +118,52 @@ func (s *Store) Save(c *domain.RiggingCase, expected int) error {
 	b, _ := json.Marshal(c)
 	var cp domain.RiggingCase
 	_ = json.Unmarshal(b, &cp)
-	s.cases[c.ID] = &cp
-	if cp.Permit != nil {
-		s.permits[cp.Permit.PermitCode] = cp.ID
+	// Capture the committed state to persist before mutating the live maps,
+	// so a failure in either durable step leaves the in-memory view unchanged.
+	newCases := make(map[string]*domain.RiggingCase, len(s.cases)+1)
+	for k, v := range s.cases {
+		newCases[k] = v
 	}
-	s.seq++
-	event := Event{Seq: s.seq, CaseID: c.ID, Type: "snapshot", At: cp.UpdatedAt, Digest: SnapshotDigest(&cp), PrevDigest: s.lastDigest}
-	if err := s.AppendEvent(event); err != nil {
+	newCases[c.ID] = &cp
+	newPermits := s.permits
+	if cp.Permit != nil {
+		newPermits = make(map[string]string, len(s.permits)+1)
+		for k, v := range s.permits {
+			newPermits[k] = v
+		}
+		newPermits[cp.Permit.PermitCode] = cp.ID
+	}
+	newSeq := s.seq + 1
+	event := Event{Seq: newSeq, CaseID: c.ID, Type: "snapshot", At: cp.UpdatedAt, Digest: SnapshotDigest(&cp), PrevDigest: s.lastDigest}
+	// Stage the prospective state, then make the durable snapshot replace first.
+	// If the (atomic temp+rename) snapshot write fails, snapshot.json is still
+	// the previous one, so nothing durable changed; just restore the live view.
+	prevCases, prevPermits, prevSeq, prevDigest := s.cases, s.permits, s.seq, s.lastDigest
+	s.cases, s.permits, s.seq = newCases, newPermits, newSeq
+	if err := s.persist(); err != nil {
+		s.cases, s.permits, s.seq, s.lastDigest = prevCases, prevPermits, prevSeq, prevDigest
 		return err
 	}
+	// Snapshot is durable at newSeq; append the matching event. If this fails,
+	// roll the snapshot back so the on-disk version and event log stay aligned.
+	before, _ := s.eventLogSize()
+	if err := s.AppendEvent(event); err != nil {
+		s.cases, s.permits, s.seq, s.lastDigest = prevCases, prevPermits, prevSeq, prevDigest
+		_ = s.persist()
+		return err
+	}
+	// If the append reported success but the file did not grow, the event did
+	// not actually land; treat it as a persistence failure and roll back.
+	if s.dir != "" {
+		if after, _ := s.eventLogSize(); after <= before {
+			s.cases, s.permits, s.seq, s.lastDigest = prevCases, prevPermits, prevSeq, prevDigest
+			_ = s.persist()
+			_ = s.truncateEvents(before)
+			return domain.ErrInvalidInput
+		}
+	}
 	s.lastDigest = event.Digest
-	return s.persist()
+	return nil
 }
 func (s *Store) FindPermit(code string) (*domain.RiggingCase, error) {
 	s.mu.RLock()
